@@ -27,12 +27,13 @@ typedef struct {
 	int screen;
 	Window root, win;
 	Pixmap pmap;
-	unsigned long colors[2];
+	unsigned long colors[3];
 } Lock;
 
 static Lock **locks;
 static int nscreens;
 static Bool running = True;
+static Bool tried = False;
 
 static void
 die(const char *errstr, ...) {
@@ -44,15 +45,33 @@ die(const char *errstr, ...) {
 	exit(EXIT_FAILURE);
 }
 
+#ifdef __linux__
+#include <fcntl.h>
+
+static void
+dontkillme(void) {
+	int fd;
+
+	fd = open("/proc/self/oom_score_adj", O_WRONLY);
+	if (fd < 0 && errno == ENOENT)
+		return;
+	if (fd < 0 || write(fd, "-1000\n", 6) != 6 || close(fd) != 0)
+		die("cannot disable the out-of-memory killer for this process\n");
+}
+#endif
+
 #ifndef HAVE_BSD_AUTH
 static const char *
 getpw(void) { /* only run as root */
 	const char *rval;
 	struct passwd *pw;
 
+	errno = 0;
 	pw = getpwuid(getuid());
-	if(!pw)
-		die("slock: cannot retrieve password entry (make sure to suid or sgid slock)");
+	if (errno)
+		die("slock: getpwuid: %s\n", strerror(errno));
+	else if (!pw)
+		die("slock: cannot retrieve password entry (make sure to suid or sgid slock)\n");
 	endpwent();
 	rval =  pw->pw_passwd;
 
@@ -68,8 +87,9 @@ getpw(void) { /* only run as root */
 #endif
 
 	/* drop privileges */
-	if(setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0)
-		die("slock: cannot drop privileges");
+	if (geteuid() == 0
+	   && ((getegid() != pw->pw_gid && setgid(pw->pw_gid) < 0) || setuid(pw->pw_uid) < 0))
+		die("slock: cannot drop privileges\n");
 	return rval;
 }
 #endif
@@ -114,9 +134,10 @@ readpw(Display *dpy, const char *pws)
 #ifdef HAVE_BSD_AUTH
 				running = !auth_userokay(getlogin(), NULL, "auth-xlock", passwd);
 #else
-				running = strcmp(crypt(passwd, pws), pws);
+				tried=True;
+				running = !!strcmp(crypt(passwd, pws), pws);
 #endif
-				if(running != False)
+				if(running)
 					XBell(dpy, 100);
 				len = 0;
 				break;
@@ -141,7 +162,7 @@ readpw(Display *dpy, const char *pws)
 				}
 			} else if(llen != 0 && len == 0) {
 				for(screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[0]);
+					XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[tried ? 2 : 0]);
 					XClearWindow(dpy, locks[screen]->win);
 				}
 			}
@@ -158,7 +179,7 @@ unlockscreen(Display *dpy, Lock *lock) {
 		return;
 
 	XUngrabPointer(dpy, CurrentTime);
-	XFreeColors(dpy, DefaultColormap(dpy, lock->screen), lock->colors, 2, 0);
+	XFreeColors(dpy, DefaultColormap(dpy, lock->screen), lock->colors, 3, 0);
 	XFreePixmap(dpy, lock->pmap);
 	XDestroyWindow(dpy, lock->win);
 
@@ -191,6 +212,8 @@ lockscreen(Display *dpy, int screen) {
 	lock->win = XCreateWindow(dpy, lock->root, 0, 0, DisplayWidth(dpy, lock->screen), DisplayHeight(dpy, lock->screen),
 			0, DefaultDepth(dpy, lock->screen), CopyFromParent,
 			DefaultVisual(dpy, lock->screen), CWOverrideRedirect | CWBackPixel, &wa);
+	XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen), COLOR3, &color, &dummy);
+	lock->colors[2] = color.pixel;
 	XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen), COLOR2, &color, &dummy);
 	lock->colors[1] = color.pixel;
 	XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen), COLOR1, &color, &dummy);
@@ -244,20 +267,24 @@ main(int argc, char **argv) {
 	else if(argc != 1)
 		usage();
 
+#ifdef __linux__
+	dontkillme();
+#endif
+
 	if(!getpwuid(getuid()))
-		die("slock: no passwd entry for you");
+		die("slock: no passwd entry for you\n");
 
 #ifndef HAVE_BSD_AUTH
 	pws = getpw();
 #endif
 
 	if(!(dpy = XOpenDisplay(0)))
-		die("slock: cannot open display");
+		die("slock: cannot open display\n");
 	/* Get the number of screens in display "dpy" and blank them all. */
 	nscreens = ScreenCount(dpy);
 	locks = malloc(sizeof(Lock *) * nscreens);
 	if(locks == NULL)
-		die("slock: malloc: %s", strerror(errno));
+		die("slock: malloc: %s\n", strerror(errno));
 	int nlocks = 0;
 	for(screen = 0; screen < nscreens; screen++) {
 		if ( (locks[screen] = lockscreen(dpy, screen)) != NULL)
